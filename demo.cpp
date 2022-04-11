@@ -8,7 +8,7 @@
 using namespace std;
 using Eigen::MatrixXd;
 
-int main() {
+int main(int argc, char *argv[]) {
     // dataset
     vector<string> ds = {"Handwritten_fea"};
 

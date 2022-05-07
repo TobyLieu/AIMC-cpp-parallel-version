@@ -8,7 +8,7 @@ print(mat.keys())
 for i in range(6):
     data = [mat[element[i]][:] for element in mat['X']]
     np.savetxt('Handwritten_fea/X/X' + str(i) + '.txt',
-               data[0],
+               np.transpose(data[0]),
                delimiter=" ",
                fmt="%.12f")
 

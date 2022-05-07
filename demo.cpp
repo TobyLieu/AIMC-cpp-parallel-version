@@ -8,6 +8,23 @@
 using namespace std;
 using Eigen::MatrixXd;
 
+void mapstd(MatrixXd& m) {
+    Eigen::MatrixXd mean = m.rowwise().mean();  //<==> m.rowwise().sum() / m.cols();
+    for (int i = 0; i < m.rows(); i++) {
+        double mean_ = mean(i, 0);
+        double scale = 1. / (m.cols() - 1);
+        double sqsum_ = 0;
+        for (int j = 0; j < m.cols(); j++) {
+            sqsum_ += (m(i, j) - mean_) * (m(i, j) - mean_);
+        }
+        double variance_ = sqsum_ * scale;
+        double stddev_ = std::sqrt(variance_);
+        // cout << mean_ << " " << variance_ << " " << stddev_ << endl;
+        m.row(i) -= MatrixXd::Constant(1, m.cols(), mean_);
+        m.row(i) /= stddev_;
+    }
+}
+
 MatrixXd EuDist2(MatrixXd A, MatrixXd B) {
     MatrixXd res(A.rows(), B.rows());
     for (int i = 0; i < A.rows(); i++) {
@@ -18,7 +35,7 @@ MatrixXd EuDist2(MatrixXd A, MatrixXd B) {
     return res;
 }
 
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[]) {
     // dataset
     vector<string> ds = {"Handwritten_fea"};
 
@@ -83,7 +100,7 @@ int main(int argc, char *argv[]) {
                 int di = X[i].cols();
                 MatrixXd tmp = MatrixXd::Zero(di, d[id]);
                 G.push_back(tmp);
-                // mapstd
+                mapstd(X[i]);  // mapstd X已经转置过了，不用再转置
             }
             // initialize G,F
             MatrixXd F = MatrixXd::Ones(d[id], k);
@@ -100,7 +117,17 @@ int main(int argc, char *argv[]) {
 
             while (flag) {
                 iter = iter + 1;
+
                 vector<MatrixXd> XvYT(m);
+                vector<MatrixXd> partJ(m);
+                // MatrixXd J = MatrixXd::Zero(d[id], k);
+                MatrixXd J;
+                vector<MatrixXd> partloss(m);
+                MatrixXd loss;
+                MatrixXd aloss;
+                MatrixXd Ftmp;
+                MatrixXd term = MatrixXd::Zero(m, 1);
+
                 // optimize G_i dv*d
                 int myid, numprocs;
                 MPI_Init(&argc, &argv);
@@ -116,64 +143,71 @@ int main(int argc, char *argv[]) {
                             }
                         }
                     }
-                    Eigen::JacobiSVD<MatrixXd> svd(XvYT[iv] * F.transpose(), Eigen::ComputeFullV | Eigen::ComputeFullU);
+                    Eigen::JacobiSVD<MatrixXd> svd(XvYT[iv] * F.transpose(), Eigen::ComputeThinU | Eigen::ComputeThinV);
                     G[iv] = svd.matrixU() * svd.matrixV().transpose();  // svds?
                 }
-                MPI_Finalize();
+
+                MPI_Barrier(MPI_COMM_WORLD);
 
                 // optimize F d*k
-                vector<MatrixXd> partJ(m);
-                MPI_Init(&argc, &argv);
-                MPI_Comm_size(MPI_COMM_WORLD, &numprocs);
-                MPI_Comm_rank(MPI_COMM_WORLD, &myid);
-                printf("Process %d of %d.\n", myid, numprocs);
                 for (int ia = myid; ia < m; ia += numprocs) {
-                    partJ[ia] = alpha[ia] * G[ia].transpose() * XvYT[ia];
+                    partJ[ia] = alpha(0, ia) * G[ia].transpose() * XvYT[ia];
                 }
-                MPI_Finalize();
-                MatrixXd J = MatrixXd::Zero();
-                for (int i = 0; i < m; i++) {
-                    J += partJ[i];
+                MPI_Barrier(MPI_COMM_WORLD);
+                if (myid == 0) {
+                    J = MatrixXd::Zero(partJ[0].rows(), partJ[0].cols());
+                    for (int i = 0; i < m; i++) {
+                        J += partJ[i];
+                    }
+                    Eigen::JacobiSVD<MatrixXd> svd_J(J, Eigen::ComputeThinV | Eigen::ComputeThinU);
+                    F = svd_J.matrixU() * svd_J.matrixV().transpose();
                 }
-                Eigen::JacobiSVD<MatrixXd> svd_J(J, Eigen::ComputeFullV | Eigen::ComputeFullU);
-                F = svd_J.matrixU() * svd_J.matrixV().transpose();
+
+                MPI_Barrier(MPI_COMM_WORLD);
 
                 // optimize Y n*1
-                vector<MatrixXd> partloss(m);
-                MPI_Init(&argc, &argv);
-                MPI_Comm_size(MPI_COMM_WORLD, &numprocs);
-                MPI_Comm_rank(MPI_COMM_WORLD, &myid);
-                printf("Process %d of %d.\n", myid, numprocs);
                 for (int ij = myid; ij < m; ij += numprocs) {
-                    partloss[ij] = alpha[ij] * EuDist2(X[ij].transpose(), F.transpose() * G[ij].transpose());
+                    partloss[ij] = alpha(0, ij) * EuDist2(X[ij].transpose(), F.transpose() * G[ij].transpose());
                 }
-                MPI_Finalize();
-                MatrixXd loss = MatrixXd::Zero();
-                for (int i = 0; i < m; i++) {
-                    loss += partloss[i];
+                MPI_Barrier(MPI_COMM_WORLD);
+                if (myid == 0) {
+                    for (int i = 0; i < m; i++) {
+                        loss += partloss[i];
+                    }
+                    // min
+                    for (int i = 0; i < loss.rows(); i++) {
+                        MatrixXd::Index minRow, minCol;
+                        double min = loss.minCoeff(&minRow, &minCol);
+                        Y(i, 0) = minCol;
+                    }
                 }
-                // min?
+
+                MPI_Barrier(MPI_COMM_WORLD);
 
                 // optimize alpha
-                MatrixXd aloss = MatrixXd::Zero(1, m);
-                MPI_Init(&argc, &argv);
-                MPI_Comm_size(MPI_COMM_WORLD, &numprocs);
-                MPI_Comm_rank(MPI_COMM_WORLD, &myid);
-                printf("Process %d of %d.\n", myid, numprocs);
-                for (int iv = myid; iv < m; iv += numprocs) {
-                    // sum
+                if (myid == 0) {
+                    aloss = MatrixXd::Zero(1, m);
+                    Ftmp = MatrixXd::Zero(Y.rows(), 1);
+                    for (int i = 0; i < Y.rows(); i++) {
+                        Ftmp(i, 0) = F(i, Y(i, 0));
+                    }
                 }
-                MPI_Finalize();
-                alpha = 1 / (2 * aloss.array());
+                MPI_Barrier(MPI_COMM_WORLD);
+                for (int iv = myid; iv < m; iv += numprocs) {
+                    aloss(0, iv) = std::sqrt((X[iv] - G[iv] * Ftmp).array().square().sum());
+                }
+                MPI_Barrier(MPI_COMM_WORLD);
+                if (myid == 0) {
+                    alpha = 1 / (2 * aloss.array());
+                }
 
                 //
-                MatrixXd term = MatrixXd::Zero(m, 1);
                 MPI_Init(&argc, &argv);
                 MPI_Comm_size(MPI_COMM_WORLD, &numprocs);
                 MPI_Comm_rank(MPI_COMM_WORLD, &myid);
                 printf("Process %d of %d.\n", myid, numprocs);
                 for (int iv = myid; iv < m; iv += numprocs) {
-                    // sum
+                    term(iv, 0) = (X[iv] - G[iv] * Ftmp).array().square().sum();
                 }
                 MPI_Finalize();
                 obj.push_back((alpha * term)(0, 0));
@@ -185,7 +219,9 @@ int main(int argc, char *argv[]) {
 
             // toc
 
-            // res = ...
+            string file_name = "./result.txt";
+            ofstream out(file_name);
+            out << Y << endl;
         }
     }
 }
